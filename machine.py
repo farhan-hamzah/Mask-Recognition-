@@ -23,6 +23,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score
 from sklearn.metrics import f1_score, confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 from glob import glob
+import random
 
 # ============================================
 # FUNGSI 1: PARSING XML ANNOTATIONS
@@ -94,25 +95,19 @@ def parse_xml_annotation(xml_file, images_dir):
 # ============================================
 # FUNGSI 2: LOAD DATASET
 # ============================================
-
 def load_kaggle_dataset(dataset_path):
     """
-    Load dataset dari Kaggle (XML + Images)
-    
-    Args:
-        dataset_path: Path ke root folder dataset
-    
-    Returns:
-        List of dict berisi semua face data
+    Load dataset dengan UNDERSAMPLING (Memotong data mayoritas)
+    agar seimbang 50:50
     """
     annotations_dir = os.path.join(dataset_path, 'annotations')
     images_dir = os.path.join(dataset_path, 'images')
     
     print(f"Loading dataset from: {dataset_path}")
-    print(f"Annotations dir: {annotations_dir}")
-    print(f"Images dir: {images_dir}")
     
-    all_data = []
+    # Tampung data sementara
+    mask_data = []
+    no_mask_data = []
     
     # Get all XML files
     xml_files = glob(os.path.join(annotations_dir, '*.xml'))
@@ -123,19 +118,35 @@ def load_kaggle_dataset(dataset_path):
         if (i + 1) % 50 == 0:
             print(f"Processing {i+1}/{len(xml_files)} files...")
         
-        faces_data = parse_xml_annotation(xml_file, images_dir)
-        all_data.extend(faces_data)
+        faces = parse_xml_annotation(xml_file, images_dir)
+        
+        # Pisahkan langsung ke keranjang masing-masing
+        for face in faces:
+            if face['label'] == 1:
+                mask_data.append(face)
+            else:
+                no_mask_data.append(face)
     
-    print(f"\nTotal faces loaded: {len(all_data)}")
+    print(f"\nOriginal Data -> With Mask: {len(mask_data)}, Without Mask: {len(no_mask_data)}")
     
-    # Count labels
-    mask_count = sum(1 for d in all_data if d['label'] == 1)
-    no_mask_count = sum(1 for d in all_data if d['label'] == 0)
-    print(f"With Mask: {mask_count}")
-    print(f"Without Mask: {no_mask_count}")
+    # --- PROSES PEMOTONGAN DATA (UNDERSAMPLING) ---
+    # Kita potong jumlah data Masker agar sama persis dengan Tanpa Masker
+    min_len = len(no_mask_data)
+    
+    # Ambil data masker secara acak sejumlah min_len
+    if len(mask_data) > min_len:
+        print(f"⚠️ Melakukan Undersampling: Memotong data Masker dari {len(mask_data)} menjadi {min_len}...")
+        random.shuffle(mask_data) # Acak dulu
+        mask_data = mask_data[:min_len] # Potong
+    
+    # Gabungkan kembali
+    all_data = mask_data + no_mask_data
+    random.shuffle(all_data) # Acak urutannya biar tercampur
+    
+    print(f"Balanced Data -> With Mask: {len(mask_data)}, Without Mask: {len(no_mask_data)}")
+    print(f"Total Training Data: {len(all_data)}")
     
     return all_data
-
 
 # ============================================
 # FUNGSI 3: PREPROCESSING
@@ -226,6 +237,34 @@ def create_data_generators(X_train, y_train, X_val, y_val, batch_size=32):
 
 
 # ============================================
+# FUNGSI 4B: CALCULATE CLASS WEIGHTS
+# ============================================
+
+def calculate_class_weights(y_train):
+    """
+    Calculate class weights untuk mengatasi imbalance
+    
+    Args:
+        y_train: Training labels
+    
+    Returns:
+        class_weight: Dictionary of class weights
+    """
+    from sklearn.utils.class_weight import compute_class_weight
+    
+    # Hitung class weights
+    classes = np.unique(y_train)
+    weights = compute_class_weight('balanced', classes=classes, y=y_train)
+    class_weight = dict(zip(classes, weights))
+    
+    print(f"\nClass weights calculated:")
+    print(f"  Class 0 (No Mask): {class_weight[0]:.2f}")
+    print(f"  Class 1 (Mask):    {class_weight[1]:.2f}")
+    
+    return class_weight
+
+
+# ============================================
 # FUNGSI 5: BUILD MODEL (TRANSFER LEARNING)
 # ============================================
 
@@ -264,7 +303,7 @@ def build_model(input_shape=(224, 224, 3)):
     
     # Compile
     model.compile(
-        optimizer=Adam(learning_rate=0.001),
+        optimizer=Adam(learning_rate=0.0001),
         loss='binary_crossentropy',
         metrics=['accuracy']
     )
@@ -376,7 +415,7 @@ def setup_callbacks(model_save_path='best_mask_detector.h5'):
 # FUNGSI 8: TRAIN MODEL
 # ============================================
 
-def train_model(model, train_gen, val_gen, callbacks, epochs=50):
+def train_model(model, train_gen, val_gen, callbacks, epochs=50, class_weights=None):
     """
     Train model
     
@@ -386,6 +425,7 @@ def train_model(model, train_gen, val_gen, callbacks, epochs=50):
         val_gen: Validation generator
         callbacks: List of callbacks
         epochs: Number of epochs
+        class_weights: Dictionary of class weights untuk imbalance
     
     Returns:
         model, history
@@ -399,6 +439,7 @@ def train_model(model, train_gen, val_gen, callbacks, epochs=50):
         validation_data=val_gen,
         epochs=epochs,
         callbacks=callbacks,
+        class_weight=class_weights,  # Tambahkan class weights
         verbose=1
     )
     
@@ -564,9 +605,9 @@ def main_training_pipeline(dataset_path, use_custom_cnn=False):
     # Configuration
     TARGET_SIZE = (224, 224)
     BATCH_SIZE = 32
-    EPOCHS = 50
+    EPOCHS = 30
     FINE_TUNE_EPOCHS = 20
-    MODEL_SAVE_PATH = 'mask_detector_model.h5'
+    MODEL_SAVE_PATH = 'mask_detector_model.keras'
     
     print("="*50)
     print("MASK DETECTION TRAINING PIPELINE")
@@ -603,6 +644,12 @@ def main_training_pipeline(dataset_path, use_custom_cnn=False):
         X_train, y_train, X_val, y_val, batch_size=BATCH_SIZE
     )
     
+    # Step 4B: Calculate class weights untuk mengatasi imbalance
+    print("\n[4B/9] Calculating class weights...")
+    class_weights = {0: 4.0, 1: 1.0}
+    print(f"Weights set to: {class_weights}")
+    #class_weights = calculate_class_weights(y_train)
+    
     # Step 5: Build model
     print("\n[5/9] Building model...")
     if use_custom_cnn:
@@ -617,9 +664,19 @@ def main_training_pipeline(dataset_path, use_custom_cnn=False):
     # Step 7: Train model
     print("\n[7/9] Training model...")
     model, history = train_model(
-        model, train_gen, val_gen, callbacks, epochs=EPOCHS
+        model, train_gen, val_gen, callbacks, epochs=EPOCHS, 
+        class_weights=class_weights  # Pass class weights
     )
-    
+    # Step 7.5: Fine-tuning
+    print("\n[7.5/9] Starting Fine-Tuning (Meningkatkan Kecerdasan)...")
+    # Kita panggil fungsi fine_tune yang sudah ada di kodemu
+    model, history_fine = fine_tune_model(
+        model, 
+        train_gen, 
+        val_gen, 
+        callbacks, 
+        epochs=20 # Tambah 20 epoch lagi khusus untuk pendalaman materi
+    )
     # Step 8: Evaluate
     print("\n[8/9] Evaluating model...")
     evaluate_model(model, X_test, y_test)
@@ -686,8 +743,8 @@ def test_single_prediction(model_path, image_path):
 # ============================================
 
 if __name__ == "__main__":
-    # GANTI PATH INI SESUAI LOKASI DATASET ANDA!
-    DATASET_PATH = 'path/to/your/kaggle/dataset'
+    # PATH DATASET SESUAI STRUKTUR ANDA
+    DATASET_PATH = r'C:\Users\User\Mask-Recognition-\dataset'
     
     # Pilih model:
     # False = Transfer Learning (MobileNetV2) - Lebih akurat
@@ -698,4 +755,4 @@ if __name__ == "__main__":
     model = main_training_pipeline(DATASET_PATH, use_custom_cnn=USE_CUSTOM_CNN)
     
     # Test prediksi (uncomment jika ingin test)
-    # test_single_prediction('mask_detector_model.h5', 'path/to/test/image.jpg')
+    # test_single_prediction('mask_detector_model.h5', r'C:\Users\User\path\to\test\image.jpg')
